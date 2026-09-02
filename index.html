@@ -1,0 +1,2031 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>DGM — Demon Got Me (prototype)</title>
+<style>
+  /* Minimal page styling: dark page, centered canvas, no scrollbars */
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #0b0b0e;
+    height: 100%;
+    overflow: hidden;
+    touch-action: none; /* prevents mobile scroll/zoom while tapping */
+  }
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    /* Size is set from JS (fitCanvas) to fill the window while keeping the 3:2 ratio */
+    display: block;
+    image-rendering: pixelated;
+    outline: none;
+  }
+</style>
+</head>
+<body>
+<!-- The canvas is the whole console (CANVAS_W x CANVAS_H, matching the
+     frame_cabinet images); the game renders inside its screen window -->
+<canvas id="game" width="1663" height="946"></canvas>
+
+<script>
+"use strict";
+
+/* =====================================================================
+   TUNABLE CONSTANTS — everything you might want to tweak lives here.
+   All speeds are in pixels/second, all durations in seconds.
+   ===================================================================== */
+
+// --- Screen & cabinet ---
+// The canvas matches the console art (frame_cabinet_phase1/2.png, 1663x946).
+// The game itself renders inside the console's transparent screen window,
+// whose position/size below were measured from the PNG.
+const CANVAS_W = 1663;             // full canvas width = cabinet image width (must match the <canvas> tag)
+const CANVAS_H = 946;              // full canvas height = cabinet image height
+const SCREEN_X = 319;              // screen window left edge inside the cabinet art (px)
+const SCREEN_Y = 119;              // screen window top edge (px)
+const SCREEN_W = 1021;             // screen window width  — this is the game's playfield width
+const SCREEN_H = 548;              // screen window height — this is the game's playfield height
+const BOOT_LINE_T = 0.9;           // CRT "screen turns on" line effect duration (s)
+const BOOT_VERSION_T = 1.9;        // version screen duration right after the line effect (s)
+// --- Intro (played ON the home page, ONCE per session: run -> bump -> blink -> run) ---
+const INTRO_CHAR_H = 190;          // display height of the home/intro character (px)
+const INTRO_WALK_SPEED = 450;      // run speed toward the cactus (px/s)
+const INTRO_RUN_FPS = 14;          // 2-frame run loop speed during the dash (fast = smooth)
+const HOME_CHAR_FRAC = 0.14;       // idle character position on home: LEFT side (fraction of width)
+const INTRO_CACTUS_FRAC = 0.72;    // cactus position: right part, close to the menu
+const INTRO_CACTUS_H = 100;        // cactus display height (px)
+const INTRO_BLINK_T = 0.5;         // hurt blink at the bump: 2 transparent blinks in this window (s)
+const INTRO_RUNOUT_T = 0.9;        // bare runner sprinting off screen after the bump (s)
+const INTRO_WIPE_T = 0.5;          // black wipe sliding in before the game starts (s)
+const DEATH_SEQUENCE_DURATION = 3.2; // death "beat-up" + GAME OVER slide duration (s)
+const GAMEOVER_BEAT_FRAME_T = 0.35;  // beat-up loop speed: gameover_character_1 <-> _2 (s per frame)
+const GAMEOVER_FINAL_FRAC = 0.85;    // when gameover_character_5 takes over (fraction of the sequence)
+const TITLE_SLIDE_DURATION = 0.6;  // how long the home title takes to slide in (s)
+
+// --- World speed & score calibration ---
+const BASE_SPEED = 340;            // world scroll speed at the very start of a run (px/s)
+const SPEED_RAMP_PHASE1 = 4;       // extra speed gained per second during phase 1 (px/s per s)
+const MAX_SPEED_PHASE1 = 480;      // speed cap during phase 1 (px/s)
+const SCORE_PER_PIXEL = 0.045;     // score gained per pixel traveled (calibrated: 666 in ~35-40s)
+
+// --- Phase system ---
+const PHASE_2_SCORE = 666;         // score threshold that triggers the "demon got me" switch
+const CORRUPTION_START = 500;      // score where the world visually starts to corrupt (phase 1)
+const PHASE2_GRACE_DURATION = 2.5; // slower "adaptation window" right after the switch (s)
+const PHASE2_GRACE_MULT = 0.8;     // speed multiplier applied during the grace window
+const PHASE2_SPEED_MULT = 1.3;     // speed multiplier once the grace window ends
+const SPEED_RAMP_PHASE2 = 6;       // extra speed gained per second during phase 2 (px/s per s)
+const MAX_SPEED_PHASE2 = 700;      // absolute speed cap in phase 2 (px/s)
+
+// --- Player physics (the FEEL knobs) ---
+// NOTE: gravity and jump speeds were scaled x1.5 together with the bigger
+// world so the jump KEEPS the same duration and feel, just covers more pixels.
+const GRAVITY = 3450;              // downward acceleration (px/s²)
+const JUMP_VELOCITY = 1080;        // initial upward speed of a jump (px/s)
+const DOUBLE_JUMP_VELOCITY = 1020; // upward speed of the second (air) jump (px/s)
+const JUMP_CUT_MULT = 0.45;        // releasing early multiplies upward speed by this (tap = short hop)
+const HODL_FALL_SPEED = 165;       // max fall speed while the button is HELD ("HODL" glide, px/s)
+const MAX_FALL_SPEED = 1650;       // max fall speed in normal free fall (px/s)
+const COYOTE_TIME = 0.08;          // grace period to still jump right after leaving the ground (s)
+const JUMP_BUFFER_TIME = 0.10;     // pressing jump this early before landing still triggers it (s)
+
+// --- Player hitbox (NEVER changes during a run, only visuals change) ---
+const PLAYER_X = 230;              // fixed horizontal position of the player (~22% from the left; more left = more reaction time)
+const PLAYER_W = 84;               // hitbox width (px) — sized to the sprite: head AND tail are inside
+const PLAYER_H = 92;               // hitbox height (px) — matches the drawn character height
+const HITBOX_PAD = 6;              // collision forgiveness: hitbox is shrunk by this on each side (px)
+
+// --- Player sprites (phase 1) ---
+const ANIM_FPS = 10;               // speed of the run / hold animation loops (frames per second)
+const RUN_FRAME_COUNT = 6;         // number of player_p1_run_* frames
+const HOLD_FRAME_COUNT = 3;        // number of player_p1_hold_* frames
+const DEBUG_HITBOX = true;         // true = draw the real collision box over the sprite (alignment check)
+const PLAYER_SPRITE_H = 96;        // EVERY player frame is drawn at exactly this height (px):
+                                   // run, jump, doublejump and hold all render the same size
+
+// --- World layout ---
+const GROUND_Y = 460;              // vertical position of the ground line (px from top of the screen window)
+
+// --- Obstacle generation (time-based spacing => always playable at any speed) ---
+const SPAWN_GAP_MIN = 0.95;        // minimum time between two hazards (s)
+const SPAWN_GAP_MAX = 1.70;        // maximum time between two hazards (s)
+// 3 FIXED size presets per obstacle type AND per phase (preset N uses image _N).
+// Only the HEIGHT is authoritative: the width is computed from the image's
+// TRIMMED aspect ratio (never stretched). w = fallback when no image exists.
+const GROUND_OBSTACLE_SIZES_P1 = [
+  { w: 71, h: 82 },                // cactus 1
+  { w: 79, h: 66 },                // cactus 2 (wide & low)
+  { w: 58, h: 88 }                 // cactus 3 (narrow & tall)
+];
+const GROUND_OBSTACLE_SIZES_P2 = [
+  { w: 90, h: 118 },               // 1: the gorilla (a bit bigger)
+  { w: 96, h: 195 },               // 2: the jabba — tall on purpose: DOUBLE JUMP required
+  { w: 87, h: 145 }                // 3: the moai (between the gorilla and the jabba)
+];
+// Air presets (the BOTTOM edge always sits on the same clearance line).
+// Phase 1 uses a SINGLE flying obstacle for now, medium sized.
+const AIR_OBSTACLE_SIZES_P1 = [
+  { w: 169, h: 100 }               // the one phase-1 flying obstacle (medium)
+];
+const AIR_OBSTACLE_SIZES_P2 = [
+  { w: 69, h: 150 },               // air preset 1
+  { w: 80, h: 150 },               // air preset 2 (reduced a bit)
+  { w: 60, h: 85 }                 // air preset 3 (small)
+];
+const OVERHEAD_CLEARANCE = 38;     // free space between the player's head (running) and an overhead block (px)
+const GAP_WIDTH_MIN = 110;         // hole in the ground: min width (px) — must stay jumpable
+const GAP_WIDTH_MAX = 170;         // hole in the ground: max width (px)
+
+// --- Collectibles (3 kinds: points, boost, hodl) ---
+const COLLECT_VALUE = 20;          // score gained per POINTS collectible
+const COLLECT_RADIUS = 22;         // collectible half-height (px) — the pickup box hugs the artwork
+const COLLECT_SPAWN_MIN = 1.5;     // min time between collectibles (s)
+const COLLECT_SPAWN_MAX = 3.5;     // max time between collectibles (s)
+const COLLECT_WEIGHT_BOOST = 0.12; // chance a spawned collectible is a BOOST (0..1)
+const COLLECT_WEIGHT_HODL = 0.22;  // chance it is a HODL token (the rest are points)
+
+// --- BOOST pickup (collectible_boost) ---
+const BOOST_DURATION = 1.6;        // seconds of boost after grabbing one
+const BOOST_SPEED_MULT = 1.45;     // world speed multiplier while boosted
+// While boosted the player SMASHES through obstacles (holes still kill!)
+
+// --- HODL meter (the glide is now a resource, refilled by collectible_hodl) ---
+const HODL_METER_MAX = 3.0;        // max seconds of glide the meter can store
+const HODL_START = 1.5;            // glide seconds available at the start of a run
+const HODL_REFILL = 1.0;           // glide seconds given by one HODL token
+// Tip: set HODL_START and HODL_METER_MAX very high to get the old unlimited glide back
+
+// --- Fire (phase 2) — DECORATIVE ONLY: flames lick the left edge, never kill ---
+const FIRE_WALL_X = 26;            // fixed x position of the decorative flame edge (px)
+
+// --- 666 transition ---
+const PHASE2_FREEZE_T = 1.0;       // gameplay freeze at the switch, so the 666 can sink in (s)
+const PHASE2_666_T = 2.0;          // how long the big 666 stays highlighted on screen (s)
+
+// --- Corruption omen: the "sonic" (spam_warning_1/2) approaching from afar ---
+const SONIC_FRAME_T = 0.35;        // seconds per frame of the 2-frame stop-motion loop
+const SONIC_MAX_ALPHA = 0.30;      // its transparency once gigantic (at 666)
+const SONIC_END_SCALE = 1.4;       // its height at 666, as a fraction of the screen height
+
+// --- HUD placement (the cabinet art slightly overlaps the window edges) ---
+const HUD_INSET_X = 64;            // horizontal distance of the HUD from the screen edges (px)
+const HUD_INSET_Y = 42;            // vertical distance of the HUD from the top (px)
+
+// --- Phase 2 background animation (visual only, gameplay untouched) ---
+// The bg_phase2.png image itself is drawn once and stays FIXED; only the
+// effects layered on top of it (flames, smoke, embers) are animated.
+const BG_FLAME_COUNT = 5;          // extra procedural flame spots over the painted fires
+const BG_SMOKE_RATE = 0.18;        // seconds between two rising smoke puffs
+const BG_SMOKE_MAX = 40;           // cap on simultaneous smoke puffs (keeps things subtle)
+const BG_EMBER_COUNT = 14;         // floating embers drifting through the air
+
+// --- Juice / feedback ---
+const FLASH_DURATION = 0.12;       // duration of screen flashes (s)
+const SHAKE_DURATION = 0.35;       // duration of screen shake on death / phase switch (s)
+const SHAKE_STRENGTH = 6;          // max shake offset (px)
+const RESTART_LOCK = 0.5;          // delay before the game-over screen accepts a restart input (s)
+const SOUND_VOLUME = 0.07;         // master volume of the little beeps (0 = mute)
+
+/* =====================================================================
+   SETUP
+   ===================================================================== */
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+// W/H are the GAME's coordinates: every screen and all gameplay render inside
+// the console's screen window, whose size is SCREEN_W x SCREEN_H.
+const W = SCREEN_W;
+const H = SCREEN_H;
+
+// --- Responsive scaling: fill the window, keep the cabinet ratio, stay centered ---
+function fitCanvas() {
+  const scale = Math.min(window.innerWidth / CANVAS_W, window.innerHeight / CANVAS_H);
+  canvas.style.width = Math.floor(CANVAS_W * scale) + "px";
+  canvas.style.height = Math.floor(CANVAS_H * scale) + "px";
+}
+window.addEventListener("resize", fitCanvas);
+fitCanvas();
+
+/* ---------------------------------------------------------------------
+   IMAGE SLOT SYSTEM
+   Each visual element tries to load assets/<slot>.png. If the file is
+   missing, the game silently draws its colored-shape placeholder instead.
+   Drop a PNG into assets/ later and it replaces the shape automatically,
+   without touching the code.
+   --------------------------------------------------------------------- */
+const ASSET_SLOTS = [
+  "frame_cabinet", "frame_cabinet_phase1", "frame_cabinet_phase2",
+  "home_bg", "home_title",
+  "home_character", "home_character_1", "home_character_run1", "home_character_run2",
+  "home_character_hurt1", "home_character_hurt2", "home_character_hurt3",
+  "player_p1_run_1", "player_p1_run_2", "player_p1_run_3",
+  "player_p1_run_4", "player_p1_run_5", "player_p1_run_6",
+  "player_p1_hold_1", "player_p1_hold_2", "player_p1_hold_3",
+  "player_p1_jump", "player_p1_doublejump", "player_p1_hurt",
+  "player_p2_run_1", "player_p2_run_2", "player_p2_run_3",
+  "player_p2_run_4", "player_p2_run_5", "player_p2_run_6",
+  "player_p2_hold_1", "player_p2_hold_2", "player_p2_hold_3",
+  "player_p2_jump", "player_p2_doublejump", "player_p2_hurt",
+  "obstacle_ground_p1", "obstacle_ground_p1_1", "obstacle_ground_p1_2", "obstacle_ground_p1_3",
+  "obstacle_air_p1", "obstacle_air_p1_1", "obstacle_air_p1_2", "obstacle_air_p1_3",
+  "obstacle_ground_p2", "obstacle_ground_p2_1", "obstacle_ground_p2_2", "obstacle_ground_p2_3",
+  "obstacle_air_p2", "obstacle_air_p2_1", "obstacle_air_p2_2", "obstacle_air_p2_3",
+  "collectible_points", "collectible_points_p1", "collectible_points_p2",
+  "collectible_boost", "collectible_hodl",
+  "pause_menu_check", "spam_warning_1", "spam_warning_2",
+  "gear_jetpack", "gear_sneaker",
+  "bg_phase1", "bg_phase2", "ground_phase1", "ground_phase2",
+  "gameover_character_1", "gameover_character_2", "gameover_character_3",
+  "gameover_character_4", "gameover_character_5",
+  "leaderboard_bg", "leaderboard_character",
+  "leaderboard_character_1", "leaderboard_character_2",
+  "leaderboard_character_3", "leaderboard_character_4"
+];
+const assets = {}; // only slots whose PNG actually loaded end up in here
+
+for (const name of ASSET_SLOTS) {
+  const img = new Image();
+  img.onload = () => { assets[name] = img; };
+  img.onerror = () => { /* file missing: the fallback shape will be drawn, no error */ };
+  img.src = "assets/" + name + ".png";
+}
+
+// Some source images have transparent padding around the artwork. This table
+// (opaque pixel bounds, measured from the PNGs) lets drawSlot render ONLY the
+// artwork — so the drawn rect, and therefore the hitbox, hugs the visible
+// pixels on all four sides. Re-measure if these images are replaced.
+const SPRITE_TRIM = {
+  "obstacle_ground_p2_1": { x: 271, y: 212, w: 473, h: 608 },  // gorilla
+  "obstacle_ground_p2_2": { x: 227, y: 214, w: 597, h: 614 },  // jabba
+  "obstacle_ground_p2_3": { x: 348, y: 214, w: 335, h: 594 },  // moai
+  "obstacle_air_p2_1": { x: 367, y: 69, w: 289, h: 824 },
+  "obstacle_air_p2_2": { x: 171, y: 142, w: 581, h: 729 },
+  "obstacle_air_p2_3": { x: 193, y: 250, w: 638, h: 524 },
+  "obstacle_air_p1_1": { x: 181, y: 134, w: 1177, h: 697 },
+  "collectible_points_p1": { x: 201, y: 202, w: 622, h: 619 },
+  "collectible_points_p2": { x: 252, y: 192, w: 521, h: 640 },
+  "collectible_boost": { x: 202, y: 263, w: 620, h: 486 },
+  "collectible_hodl": { x: 290, y: 219, w: 440, h: 584 },
+  "pause_menu_check": { x: 403, y: 332, w: 1237, h: 1378 },
+  "spam_warning_1": { x: 522, y: 525, w: 1155, h: 1150 },
+  "spam_warning_2": { x: 522, y: 525, w: 1155, h: 1150 },
+  "leaderboard_character_1": { x: 133, y: 220, w: 758, h: 639 },
+  "leaderboard_character_2": { x: 99, y: 191, w: 628, h: 640 },
+  "leaderboard_character_3": { x: 200, y: 216, w: 616, h: 616 },
+  "leaderboard_character_4": { x: 304, y: 155, w: 467, h: 670 }
+};
+
+// Draws the slot image if it loaded (using its trim when measured).
+// Returns true if drawn, false so the caller draws the fallback shape.
+function drawSlot(name, x, y, w, h) {
+  const img = assets[name];
+  if (!img) return false;
+  const t = SPRITE_TRIM[name];
+  if (t) ctx.drawImage(img, t.x, t.y, t.w, t.h, x, y, w, h);
+  else ctx.drawImage(img, x, y, w, h);
+  return true;
+}
+
+// width/height ratio of a slot's VISIBLE artwork (trimmed if measured)
+function slotAspect(name) {
+  const t = SPRITE_TRIM[name];
+  if (t) return t.w / t.h;
+  const img = assets[name];
+  return img ? img.width / img.height : 1;
+}
+
+// Game state machine — one screen at a time:
+// "boot" -> "home" -> "intro" -> "playing" -> "dying" -> "gameover" -> "leaderboard"
+let state = "boot";
+let bootTimer = BOOT_LINE_T + BOOT_VERSION_T; // counts down the whole boot sequence
+let homeTime = 0;              // time spent on the home screen (drives animations)
+let introTime = 0;             // time elapsed in the intro cinematic (s)
+let deathTimer = 0;            // counts down the death mini-sequence
+let menuIndexHome = 0;         // selected item on HOME (0 = start game, 1 = leaderboard)
+let menuIndexGameOver = 0;     // selected item on GAME OVER (0 = run again, 1 = leaderboard)
+
+// Best score, persisted in localStorage (wrapped in try/catch for file:// quirks)
+let bestScore = 0;
+try { bestScore = Number(localStorage.getItem("dgm_best")) || 0; } catch (e) {}
+
+// Run variables (initialized in resetRun)
+let player, obstacles, gaps, collectibles, particles, popups;
+let score, runTime, currentSpeed, worldX;
+let phase, speedAtSwitch, graceTimer, phase2Time;
+let hazardTimer, collectTimer;
+let holding = false;       // is the jump button currently held? (drives HODL glide)
+let jumpBufferTimer = 0;   // time left on a buffered jump press
+let flashTimer = 0, flashColor = "#fff";
+let shakeTimer = 0;
+let gameOverTime = 0;      // timestamp of death, used for the restart lock
+let deathCause = "";       // short reason shown on the game-over screen
+let squash = 1;            // visual-only vertical squash of the player (landing feedback)
+let bgSmoke = [];          // phase 2 background smoke puffs (visual only)
+let bgSmokeTimer = 0;      // countdown to the next smoke puff
+let boostTimer = 0;        // seconds of BOOST left (speed burst + smashing obstacles)
+let hodlMeter = 0;         // seconds of HODL glide left in the meter
+let freezeTimer = 0;       // 666-switch freeze countdown (the world stands still)
+let transitionTimer = 0;   // countdown of the big-666 highlight at the switch
+let paused = false;        // "P" pauses the run (world frozen, overlay shown)
+let introSeen = false;     // the cactus gag plays only once per session
+let gearDebris = [];       // intro only: jetpack & sneakers bouncing away
+let bootSoundPlayed = false; // soft power-on sound, once (browsers may mute it before any click)
+let bootChimeDone = false;   // fallback: play the chime on the FIRST press (audio unlocked there)
+let corruptStartAt = -1;   // runTime when the score crossed CORRUPTION_START (-1 = not yet)
+let corruptDuration = 1;   // time 500 -> 666 with zero pickups (the sonic's growth pace)
+let sonicGrowFinal = 0;    // the sonic's growth level frozen at the 666 switch
+
+function resetRun() {
+  player = {
+    x: PLAYER_X,
+    y: GROUND_Y - PLAYER_H,
+    vy: 0,               // vertical speed (positive = falling)
+    grounded: true,
+    jumpsUsed: 0,        // 0 = fresh, 1 = jumped, 2 = double jump used
+    coyoteTimer: 0       // time since the player left the ground without jumping
+  };
+  obstacles = [];        // {type:'ground'|'overhead', x, y, w, h}
+  gaps = [];             // {x, w} holes in the ground
+  collectibles = [];     // {x, y, r}
+  particles = [];        // {x, y, vx, vy, life, color, size}
+  popups = [];           // floating texts {x, y, text, life, color, big}
+  score = 0;
+  runTime = 0;
+  currentSpeed = BASE_SPEED;
+  worldX = 0;            // total distance traveled, used for ground marks animation
+  phase = 1;
+  speedAtSwitch = 0;
+  graceTimer = 0;
+  phase2Time = 0;
+  freezeTimer = 0;
+  transitionTimer = 0;
+  paused = false;
+  corruptStartAt = -1;
+  sonicGrowFinal = 0;
+  hazardTimer = 1.2;     // small breather before the first obstacle
+  collectTimer = 2.0;
+  jumpBufferTimer = 0;
+  squash = 1;
+  bgSmoke = [];
+  bgSmokeTimer = 0;
+  boostTimer = 0;
+  hodlMeter = HODL_START;
+}
+
+/* =====================================================================
+   AUDIO — tiny WebAudio beeps, no files needed
+   ===================================================================== */
+
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+  }
+  if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+}
+
+// Plays a short beep. freqFrom/freqTo lets us do little pitch slides.
+function beep(freqFrom, freqTo, dur, type) {
+  if (!audioCtx || SOUND_VOLUME <= 0) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  const t = audioCtx.currentTime;
+  osc.type = type || "square";
+  osc.frequency.setValueAtTime(freqFrom, t);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(20, freqTo), t + dur);
+  gain.gain.setValueAtTime(SOUND_VOLUME, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(t);
+  osc.stop(t + dur);
+}
+
+const sndJump = () => beep(300, 520, 0.10, "square");
+const sndDoubleJump = () => beep(420, 700, 0.10, "square");
+const sndCollect = () => beep(700, 1100, 0.09, "sine");
+const sndBoost = () => beep(500, 1400, 0.25, "sawtooth");
+const sndHodl = () => beep(400, 800, 0.12, "triangle");
+const sndSmash = () => beep(250, 90, 0.15, "square");
+const sndDeath = () => beep(220, 40, 0.45, "sawtooth");
+const sndBootUp = () => beep(160, 640, 0.7, "sine"); // soft, gentle power-on sweep
+const sndPhase = () => beep(120, 45, 0.7, "sawtooth");
+
+/* =====================================================================
+   JUICE HELPERS
+   ===================================================================== */
+
+function flash(color, dur) { flashColor = color; flashTimer = dur || FLASH_DURATION; }
+function shake() { shakeTimer = SHAKE_DURATION; }
+
+function addPopup(x, y, text, color, big) {
+  popups.push({ x, y, text, color, big: !!big, life: 0.8 });
+}
+
+function burst(x, y, color, count, speed) {
+  for (let i = 0; i < count; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = (0.3 + Math.random() * 0.7) * speed;
+    particles.push({
+      x, y,
+      vx: Math.cos(a) * s,
+      vy: Math.sin(a) * s - 60,
+      life: 0.4 + Math.random() * 0.3,
+      color,
+      size: 2 + Math.random() * 3
+    });
+  }
+}
+
+/* =====================================================================
+   INPUT — one button: Space / click / tap. Press = jump, hold = HODL.
+   ===================================================================== */
+
+// --- Screen flow helpers ---
+function goHome() { state = "home"; homeTime = 0; menuIndexHome = 0; }
+function startIntro() {
+  // The cactus gag plays only ONCE per session; afterwards games start directly
+  if (introSeen) { startPlaying(); return; }
+  introSeen = true;
+  state = "intro";
+  introTime = 0;
+  gearDebris = [];
+}
+function startPlaying() { resetRun(); state = "playing"; }
+
+// Key moments of the intro gag, all derived from the constants above
+function introTimeline() {
+  const cactusX = W * INTRO_CACTUS_FRAC;
+  const stopX = cactusX - INTRO_CACTUS_H * 0.5 - 40;  // where the character bumps
+  const bump = Math.max(0.2, (stopX - W * HOME_CHAR_FRAC) / INTRO_WALK_SPEED);
+  const blinkEnd = bump + INTRO_BLINK_T;              // hurt blink (gear pops off)
+  const wipe = blinkEnd + INTRO_RUNOUT_T;             // black wipe starts
+  const end = wipe + INTRO_WIPE_T;                    // game starts
+  return { cactusX, stopX, bump, blinkEnd, wipe, end };
+}
+
+// The gear flying off at the bump: small pieces that bounce on the ground,
+// blink and vanish (jetpack in blue, sneakers in white/red)
+function spawnGearDebris(x) {
+  // Each piece tries to use its real image (assets/gear_jetpack.png and
+  // assets/gear_sneaker.png); the colored squares are only the fallback.
+  gearDebris = [
+    { kind: "jetpack", x: x - 10, y: GROUND_Y - 120, vx: -160, vy: -260, w: 30, h: 42, color: "#2a5fd8", life: 1.4 },
+    { kind: "sneaker", x: x + 6,  y: GROUND_Y - 40,  vx: -220, vy: -180, w: 26, h: 16, color: "#f0f0f0", life: 1.4 },
+    { kind: "sneaker", x: x - 4,  y: GROUND_Y - 40,  vx: -120, vy: -320, w: 26, h: 16, color: "#e03030", life: 1.4 }
+  ];
+}
+
+function updateGearDebris(dt) {
+  for (const g of gearDebris) {
+    g.life -= dt;
+    g.vy += 1800 * dt;
+    g.x += g.vx * dt;
+    g.y += g.vy * dt;
+    if (g.y + g.h > GROUND_Y && g.vy > 0) { // bounce on the ground line
+      g.y = GROUND_Y - g.h;
+      g.vy *= -0.5;
+      g.vx *= 0.8;
+    }
+  }
+  gearDebris = gearDebris.filter(g => g.life > 0);
+}
+
+// Converts a mouse/touch event into internal canvas coordinates (0..W, 0..H)
+function canvasPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  const cx = (e.touches && e.touches[0]) ? e.touches[0].clientX : e.clientX;
+  const cy = (e.touches && e.touches[0]) ? e.touches[0].clientY : e.clientY;
+  // convert to canvas pixels, then into screen-window (game) coordinates
+  return {
+    x: (cx - rect.left) * CANVAS_W / rect.width - SCREEN_X,
+    y: (cy - rect.top) * CANVAS_H / rect.height - SCREEN_Y
+  };
+}
+
+// Arrow up/down navigation inside menus
+function menuMove(dir) {
+  if (state === "home") menuIndexHome = (menuIndexHome + dir + 2) % 2;
+  else if (state === "gameover") menuIndexGameOver = (menuIndexGameOver + dir + 2) % 2;
+  else return;
+  beep(500, 650, 0.05, "square"); // small navigation blip
+}
+
+// Menu rows vertical positions (used for drawing AND for click/tap selection)
+const HOME_MENU_Y = [330, 382];      // more vertically centered, clear of the ground line
+const GAMEOVER_MENU_Y = [400, 452];
+
+// Clicking/tapping picks the menu row closest to the click before confirming
+function pickMenuFromClick(pos) {
+  if (!pos) return;
+  if (state === "home") {
+    menuIndexHome = Math.abs(pos.y - HOME_MENU_Y[0]) <= Math.abs(pos.y - HOME_MENU_Y[1]) ? 0 : 1;
+  } else if (state === "gameover") {
+    menuIndexGameOver = Math.abs(pos.y - GAMEOVER_MENU_Y[0]) <= Math.abs(pos.y - GAMEOVER_MENU_Y[1]) ? 0 : 1;
+  }
+}
+
+// The single action button (Space / click / tap) — behavior depends on the screen
+function pressButton(clickPos) {
+  ensureAudio();
+  // Browsers only allow audio after the first user interaction, so the boot
+  // chime attempted at page load is usually muted. Replay it here, on the
+  // very first press, while we're still at the start of the session.
+  if (!bootChimeDone) {
+    bootChimeDone = true;
+    if (state === "boot" || state === "home") sndBootUp();
+  }
+  if (paused && state === "playing") return; // frozen: only "P" resumes
+  holding = true;
+
+  switch (state) {
+    case "boot":
+      goHome(); // pressing skips the boot effect
+      return;
+
+    case "home":
+      pickMenuFromClick(clickPos);
+      beep(600, 900, 0.08, "square"); // confirm blip
+      if (menuIndexHome === 0) startIntro();
+      else state = "leaderboard";
+      return;
+
+    case "intro":
+      startPlaying(); // pressing skips the intro
+      return;
+
+    case "dying":
+      return; // no input during the death sequence
+
+    case "gameover":
+      if (performance.now() - gameOverTime < RESTART_LOCK * 1000) return;
+      pickMenuFromClick(clickPos);
+      beep(600, 900, 0.08, "square"); // confirm blip
+      if (menuIndexGameOver === 0) startIntro();
+      else state = "leaderboard";
+      return;
+
+    case "leaderboard":
+      // brief lock right after a death so the leaderboard isn't skipped by accident
+      if (performance.now() - gameOverTime < RESTART_LOCK * 1000) return;
+      goHome();
+      return;
+  }
+
+  // state === "playing": try to jump
+  const canGroundJump = player.grounded || (player.coyoteTimer < COYOTE_TIME && player.jumpsUsed === 0);
+  if (canGroundJump) {
+    doJump(JUMP_VELOCITY, 1);
+    sndJump();
+  } else if (player.jumpsUsed < 2) {
+    doJump(DOUBLE_JUMP_VELOCITY, 2);
+    sndDoubleJump();
+  } else {
+    // No jump available: buffer the press so it fires the instant we land
+    jumpBufferTimer = JUMP_BUFFER_TIME;
+  }
+}
+
+function doJump(velocity, jumpsUsedValue) {
+  player.vy = -velocity;
+  player.grounded = false;
+  player.jumpsUsed = jumpsUsedValue;
+  squash = 1.15; // slight vertical stretch on takeoff (visual only)
+  burst(player.x + PLAYER_W / 2, player.y + PLAYER_H, phase === 1 ? "#999" : "#ff8030", 6, 120);
+}
+
+function releaseButton() {
+  holding = false;
+  // "Jump cut": releasing while still going up shortens the jump => tap = small hop
+  if (state === "playing" && player.vy < 0) {
+    player.vy *= JUMP_CUT_MULT;
+  }
+}
+
+// Keyboard: Space/Enter = action button everywhere; ArrowUp = jump in game, navigate in menus
+window.addEventListener("keydown", (e) => {
+  if (!["Space", "Enter", "ArrowUp", "ArrowDown", "KeyP"].includes(e.code)) return;
+  e.preventDefault();
+  if (e.repeat) return; // ignore auto-repeat, we handle "hold" ourselves
+  if (e.code === "KeyP") {
+    // "P" toggles pause, only during a run
+    if (state === "playing") paused = !paused;
+    return;
+  }
+  const inMenu = (state === "home" || state === "gameover");
+  if (e.code === "ArrowUp" && inMenu) { menuMove(-1); return; }
+  if (e.code === "ArrowDown") { if (inMenu) menuMove(1); return; }
+  pressButton();
+});
+window.addEventListener("keyup", (e) => {
+  if (e.code === "Space" || e.code === "Enter" || e.code === "ArrowUp") releaseButton();
+});
+
+// Mouse
+canvas.addEventListener("mousedown", (e) => { e.preventDefault(); pressButton(canvasPos(e)); });
+window.addEventListener("mouseup", releaseButton);
+
+// Touch
+canvas.addEventListener("touchstart", (e) => { e.preventDefault(); pressButton(canvasPos(e)); }, { passive: false });
+window.addEventListener("touchend", (e) => { e.preventDefault(); releaseButton(); }, { passive: false });
+window.addEventListener("touchcancel", releaseButton);
+
+/* =====================================================================
+   PROCEDURAL GENERATION
+   ===================================================================== */
+
+function rand(min, max) { return min + Math.random() * (max - min); }
+
+// Returns the loaded slot NAME for an obstacle (numbered variant first, then
+// the base single image), or null. Used both to SIZE the obstacle at spawn
+// time (width derived from the trimmed image ratio) and to DRAW it.
+function obstacleSlotName(type, phaseNum, variant) {
+  const base = (type === "ground" ? "obstacle_ground_p" : "obstacle_air_p") + phaseNum;
+  if (assets[base + "_" + (variant + 1)]) return base + "_" + (variant + 1);
+  if (assets[base]) return base;
+  return null;
+}
+
+// The collectible's slot name for its kind (points depend on the phase)
+function collectibleSlotName(kind) {
+  if (kind === "boost") return "collectible_boost";
+  if (kind === "hodl") return "collectible_hodl";
+  return assets["collectible_points_p" + phase] ? "collectible_points_p" + phase : "collectible_points";
+}
+
+// Pickup box matching the drawn artwork (height = 2r, width follows the art)
+function collectibleBox(c) {
+  const name = collectibleSlotName(c.kind);
+  const ar = assets[name] ? slotAspect(name) : 1;
+  const h = c.r * 2, w = h * ar;
+  return { x: c.x - w / 2, y: c.y - c.r, w, h };
+}
+
+function spawnHazard() {
+  const spawnX = W + 40; // just off-screen to the right
+  const roll = Math.random();
+
+  if (roll < 0.45) {
+    // Ground obstacle: jump over it. Fixed HEIGHT per preset & phase; the
+    // width comes from the trimmed image proportions (never stretched).
+    const sizes = phase === 1 ? GROUND_OBSTACLE_SIZES_P1 : GROUND_OBSTACLE_SIZES_P2;
+    let variant = Math.floor(Math.random() * sizes.length);
+    // The tall jabba (preset 2) demands a well-timed double jump: keep it out
+    // of the slower adaptation window right after the 666 switch, to stay fair.
+    if (phase === 2 && graceTimer > 0 && variant === 1) variant = Math.random() < 0.5 ? 0 : 2;
+    const s = sizes[variant];
+    const slot = obstacleSlotName("ground", phase, variant);
+    const w = slot ? s.h * slotAspect(slot) : s.w;
+    obstacles.push({ type: "ground", variant, x: spawnX, y: GROUND_Y - s.h, w, h: s.h });
+  } else if (roll < 0.75) {
+    // Overhead obstacle: run under it (do NOT jump). Fixed height, image-driven
+    // width. The bottom edge ALWAYS sits on the same clearance line (playable).
+    const airSizes = phase === 1 ? AIR_OBSTACLE_SIZES_P1 : AIR_OBSTACLE_SIZES_P2;
+    const variant = Math.floor(Math.random() * airSizes.length);
+    const s = airSizes[variant];
+    const slot = obstacleSlotName("overhead", phase, variant);
+    const w = slot ? s.h * slotAspect(slot) : s.w;
+    const bottom = GROUND_Y - PLAYER_H - OVERHEAD_CLEARANCE;
+    obstacles.push({ type: "overhead", variant, x: spawnX, y: bottom - s.h, w, h: s.h });
+  } else {
+    // Gap in the ground: jump across
+    const w = rand(GAP_WIDTH_MIN, GAP_WIDTH_MAX);
+    gaps.push({ x: spawnX, w });
+    // A gap "occupies" time on screen: push the next hazard a bit further away
+    hazardTimer += w / currentSpeed;
+  }
+
+  // A newly spawned obstacle also evicts any collectible it would swallow
+  const lastObstacle = obstacles[obstacles.length - 1];
+  if (lastObstacle && lastObstacle.x >= spawnX - 1) {
+    collectibles = collectibles.filter(c => !overlapsWithMargin(collectibleBox(c), lastObstacle, 18));
+  }
+
+  // Time-based spacing: at higher speed the pixel distance grows automatically,
+  // so the pattern stays physically jumpable at any speed.
+  hazardTimer += rand(SPAWN_GAP_MIN, SPAWN_GAP_MAX);
+}
+
+function spawnCollectible() {
+  // Pick the collectible kind from the spawn weights
+  const roll = Math.random();
+  let kind = "points";
+  if (roll < COLLECT_WEIGHT_BOOST) kind = "boost";
+  else if (roll < COLLECT_WEIGHT_BOOST + COLLECT_WEIGHT_HODL) kind = "hodl";
+
+  // RULE: a collectible must never sit inside (or touch) an obstacle.
+  // Try a few heights near the spawn point; give up this cycle if blocked.
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const y = GROUND_Y - rand(35, 215); // low = grabbed running, high = needs a jump
+    const c = { x: W + 40, y, r: COLLECT_RADIUS, kind };
+    const box = collectibleBox(c);
+    const blocked = obstacles.some(o => o.x + o.w > W - 80 && overlapsWithMargin(box, o, 18));
+    if (!blocked) { collectibles.push(c); break; }
+  }
+  collectTimer += rand(COLLECT_SPAWN_MIN, COLLECT_SPAWN_MAX);
+}
+
+/* =====================================================================
+   COLLISIONS
+   ===================================================================== */
+
+// The player's collision box, slightly shrunk for forgiveness.
+// IMPORTANT: same box in both phases — only the visuals change.
+function playerHitbox() {
+  return {
+    x: player.x + HITBOX_PAD,
+    y: player.y + HITBOX_PAD,
+    w: PLAYER_W - HITBOX_PAD * 2,
+    h: PLAYER_H - HITBOX_PAD * 2
+  };
+}
+
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// Overlap test with a safety margin around rect b (used for spawn rules)
+function overlapsWithMargin(a, b, m) {
+  return a.x - m < b.x + b.w && a.x + a.w + m > b.x && a.y - m < b.y + b.h && a.y + a.h + m > b.y;
+}
+
+// Is the center of the player's feet currently above a hole?
+function overGap() {
+  const footCenter = player.x + PLAYER_W / 2;
+  return gaps.some(g => footCenter > g.x && footCenter < g.x + g.w);
+}
+
+/* =====================================================================
+   DEATH & PHASE SWITCH
+   ===================================================================== */
+
+function die(cause) {
+  state = "dying"; // short death sequence first; the GAME OVER screen comes after
+  deathTimer = DEATH_SEQUENCE_DURATION;
+  deathCause = cause;
+  flash("#ff2020", 0.2);
+  shake();
+  sndDeath();
+  burst(player.x + PLAYER_W / 2, player.y + PLAYER_H / 2, phase === 1 ? "#333" : "#ff4020", 18, 260);
+  if (score > bestScore) {
+    bestScore = Math.floor(score);
+    try { localStorage.setItem("dgm_best", String(bestScore)); } catch (e) {}
+  }
+}
+
+function triggerPhase2() {
+  phase = 2;
+  speedAtSwitch = currentSpeed;
+  graceTimer = PHASE2_GRACE_DURATION;
+  phase2Time = 0;
+  freezeTimer = PHASE2_FREEZE_T;   // the world stands still so the 666 can sink in
+  transitionTimer = PHASE2_666_T;  // the big 666 stays highlighted this long
+  // Freeze the sonic at whatever size its time-based growth reached
+  sonicGrowFinal = corruptStartAt >= 0 ? Math.min(1, (runTime - corruptStartAt) / corruptDuration) : 0;
+  flash("#ff2200", 0.3);
+  shake();
+  sndPhase();
+}
+
+/* =====================================================================
+   UPDATE — one simulation step
+   ===================================================================== */
+
+function update(dt) {
+  // Paused: the whole world (and its juice) stands still
+  if (paused && state === "playing") return;
+
+  // --- Global timers (run in every state, for juice) ---
+  if (flashTimer > 0) flashTimer -= dt;
+  if (shakeTimer > 0) shakeTimer -= dt;
+  if (transitionTimer > 0) transitionTimer -= dt;
+  updateParticles(dt);
+  updatePopups(dt);
+
+  // --- Screen flow timers ---
+  if (state === "boot") {
+    // Soft power-on sound, once. NOTE: browsers block audio before the first
+    // user interaction, so on a fresh page load it may stay silent.
+    if (!bootSoundPlayed) {
+      bootSoundPlayed = true;
+      ensureAudio();
+      sndBootUp();
+    }
+    bootTimer -= dt;
+    if (bootTimer <= 0) goHome();
+  } else if (state === "home") {
+    homeTime += dt; // drives the title slide-in + idle character bob
+  } else if (state === "intro") {
+    const before = introTime;
+    introTime += dt;
+    const tl = introTimeline();
+    // Bump moment: bonk + the gear flies off (bouncing, blinking debris)
+    if (before < tl.bump && introTime >= tl.bump) {
+      shake();
+      sndSmash();
+      spawnGearDebris(tl.stopX);
+      beep(320, 90, 0.3, "square"); // gear-pop sound
+    }
+    updateGearDebris(dt);
+    if (introTime >= tl.end) startPlaying();
+  } else if (state === "dying") {
+    deathTimer -= dt;
+    if (deathTimer <= 0) {
+      // The death sequence flows STRAIGHT into the leaderboard (no menu screen)
+      state = "leaderboard";
+      gameOverTime = performance.now(); // short input lock so a press can't skip it instantly
+    }
+  }
+
+  if (state !== "playing") return;
+
+  // 666 freeze: everything stands still for a moment at the phase switch
+  if (freezeTimer > 0) {
+    freezeTimer -= dt;
+    return;
+  }
+
+  runTime += dt;
+
+  // --- Speed: compute the target for the current phase, ease toward it ---
+  let targetSpeed;
+  if (phase === 1) {
+    targetSpeed = Math.min(MAX_SPEED_PHASE1, BASE_SPEED + SPEED_RAMP_PHASE1 * runTime);
+  } else {
+    phase2Time += dt;
+    if (graceTimer > 0) {
+      graceTimer -= dt;
+      targetSpeed = speedAtSwitch * PHASE2_GRACE_MULT; // adaptation window: slightly slower
+    } else {
+      const t = phase2Time - PHASE2_GRACE_DURATION;    // time since the grace window ended
+      targetSpeed = Math.min(MAX_SPEED_PHASE2, speedAtSwitch * PHASE2_SPEED_MULT + SPEED_RAMP_PHASE2 * t);
+    }
+  }
+  // Smooth easing so speed changes never feel like a hard snap
+  currentSpeed += (targetSpeed - currentSpeed) * Math.min(1, 3 * dt);
+
+  // BOOST effect: temporary speed burst (the ease above is untouched,
+  // the multiplier is applied on top of it)
+  if (boostTimer > 0) boostTimer -= dt;
+
+  const dx = currentSpeed * (boostTimer > 0 ? BOOST_SPEED_MULT : 1) * dt; // pixels traveled this frame
+  worldX += dx;
+  score += dx * SCORE_PER_PIXEL;
+
+  // When corruption starts, note the moment and how long 500 -> 666 would take
+  // with ZERO pickups: that's the sonic's growth pace. Pickups make 666 arrive
+  // earlier and simply cut the growth short — no sudden size jumps.
+  if (phase === 1 && corruptStartAt < 0 && score >= CORRUPTION_START) {
+    corruptStartAt = runTime;
+    corruptDuration = (PHASE_2_SCORE - CORRUPTION_START) / (SCORE_PER_PIXEL * currentSpeed);
+  }
+
+  // --- Phase switch check ---
+  if (phase === 1 && score >= PHASE_2_SCORE) triggerPhase2();
+
+  // --- Player physics ---
+  player.vy += GRAVITY * dt;
+
+  // HODL: while held and falling, clamp the fall to a slow controlled glide.
+  // The glide now DRAINS the hodl meter; when it's empty, normal fall resumes
+  // (refill it by grabbing collectible_hodl tokens).
+  if (holding && player.vy > 0 && hodlMeter > 0) {
+    player.vy = Math.min(player.vy, HODL_FALL_SPEED);
+    hodlMeter = Math.max(0, hodlMeter - dt);
+  } else {
+    player.vy = Math.min(player.vy, MAX_FALL_SPEED);
+  }
+
+  player.y += player.vy * dt;
+
+  const standingOnGround = !overGap();
+
+  if (player.y + PLAYER_H >= GROUND_Y && standingOnGround && player.vy >= 0) {
+    // Landing
+    const wasAirborne = !player.grounded;
+    player.y = GROUND_Y - PLAYER_H;
+    player.vy = 0;
+    player.grounded = true;
+    player.jumpsUsed = 0;
+    player.coyoteTimer = 0;
+    if (wasAirborne) {
+      squash = 0.8; // small squash on landing (visual only)
+      // Buffered jump fires immediately for a snappy feel
+      if (jumpBufferTimer > 0) {
+        jumpBufferTimer = 0;
+        doJump(JUMP_VELOCITY, 1);
+        sndJump();
+      }
+    }
+  } else {
+    // Airborne (jumping, or walking over a hole)
+    if (player.grounded) {
+      player.grounded = false;
+      player.coyoteTimer = 0; // just left the ground: coyote window starts
+    } else {
+      player.coyoteTimer += dt;
+    }
+  }
+
+  if (jumpBufferTimer > 0) jumpBufferTimer -= dt;
+
+  // Squash eases back to 1 (visual only, hitbox untouched)
+  squash += (1 - squash) * Math.min(1, 10 * dt);
+
+  // Fell into a hole
+  if (player.y > H + 40) { die("fell into the void"); return; }
+
+  // --- Spawners ---
+  hazardTimer -= dt;
+  if (hazardTimer <= 0) spawnHazard();
+  collectTimer -= dt;
+  if (collectTimer <= 0) spawnCollectible();
+
+  // --- Move & clean up world objects ---
+  for (const o of obstacles) o.x -= dx;
+  for (const g of gaps) g.x -= dx;
+  for (const c of collectibles) c.x -= dx;
+  obstacles = obstacles.filter(o => o.x + o.w > -60);
+  gaps = gaps.filter(g => g.x + g.w > -60);
+  collectibles = collectibles.filter(c => c.x + c.r > -60);
+
+  // --- Collisions ---
+  const hb = playerHitbox();
+
+  for (let i = obstacles.length - 1; i >= 0; i--) {
+    const o = obstacles[i];
+    if (rectsOverlap(hb, o)) {
+      if (boostTimer > 0) {
+        // Boosted: smash straight through the obstacle
+        obstacles.splice(i, 1);
+        burst(o.x + o.w / 2, o.y + o.h / 2, "#ffd040", 12, 220);
+        sndSmash();
+        continue;
+      }
+      die(o.type === "ground" ? "hit an obstacle" : "hit a hanging block");
+      return;
+    }
+  }
+
+  for (let i = collectibles.length - 1; i >= 0; i--) {
+    const c = collectibles[i];
+    const box = collectibleBox(c); // pickup box = exactly the drawn artwork
+    if (rectsOverlap(hb, box)) {
+      collectibles.splice(i, 1);
+      if (c.kind === "boost") {
+        boostTimer = BOOST_DURATION;
+        addPopup(c.x, c.y - 14, "BOOST!", "#ffd040");
+        flash("#ffd040", 0.1);
+        sndBoost();
+      } else if (c.kind === "hodl") {
+        hodlMeter = Math.min(HODL_METER_MAX, hodlMeter + HODL_REFILL);
+        addPopup(c.x, c.y - 14, "+HODL", "#30c060");
+        sndHodl();
+      } else {
+        score += COLLECT_VALUE;
+        addPopup(c.x, c.y - 14, "+" + COLLECT_VALUE, phase === 1 ? "#444" : "#ffd040");
+        sndCollect();
+      }
+      burst(c.x, c.y, phase === 1 ? "#777" : "#ffd040", 8, 150);
+    }
+  }
+
+  // --- Phase 2 ambient background smoke (visual only) ---
+  if (phase === 2) updateBgSmoke(dt);
+
+  // (The phase-2 fire is decorative only now — it never advances, never kills.)
+}
+
+// Spawns and moves the phase-2 background smoke puffs. VISUAL ONLY:
+// nothing here touches physics, collisions or score.
+function updateBgSmoke(dt) {
+  bgSmokeTimer -= dt;
+  if (bgSmokeTimer <= 0 && bgSmoke.length < BG_SMOKE_MAX) {
+    bgSmokeTimer = BG_SMOKE_RATE;
+    // A few fixed "chimney" spots across the screen, with a little randomness
+    const srcX = [W * 0.12, W * 0.38, W * 0.63, W * 0.88][Math.floor(Math.random() * 4)];
+    bgSmoke.push({
+      x: srcX + rand(-30, 30),
+      y: GROUND_Y - rand(20, 80),   // starts near the horizon fires
+      r: rand(6, 12),               // puff radius, grows over time
+      age: 0,
+      maxLife: rand(2.5, 4.5),
+      wobble: rand(0, Math.PI * 2)  // phase offset so puffs don't wobble in sync
+    });
+  }
+  for (const s of bgSmoke) {
+    s.age += dt;
+    s.y -= (18 + s.r) * dt;                            // rise (bigger puffs rise faster)
+    s.x -= currentSpeed * 0.03 * dt;                   // slow drift, reacts to world speed
+    s.x += Math.sin(s.age * 1.5 + s.wobble) * 8 * dt;  // lazy sideways wobble
+    s.r += 4 * dt;                                     // puffs expand as they dissipate
+  }
+  bgSmoke = bgSmoke.filter(s => s.age < s.maxLife);
+}
+
+function updateParticles(dt) {
+  for (const p of particles) {
+    p.life -= dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy += 500 * dt; // light gravity on particles
+  }
+  particles = particles.filter(p => p.life > 0);
+}
+
+function updatePopups(dt) {
+  for (const p of popups) {
+    p.life -= dt;
+    p.y -= 40 * dt; // floats upward
+  }
+  popups = popups.filter(p => p.life > 0);
+}
+
+/* =====================================================================
+   DRAWING
+   ===================================================================== */
+
+// 0 -> 1 : how corrupted the phase-1 world currently looks
+function corruptionAmount() {
+  if (phase === 2) return 1;
+  if (score < CORRUPTION_START) return 0;
+  return Math.min(1, (score - CORRUPTION_START) / (PHASE_2_SCORE - CORRUPTION_START));
+}
+
+function draw() {
+  // Dark page color behind the console art (its corners are transparent)
+  ctx.fillStyle = "#0b0b0e";
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+  // Black backing slightly larger than the screen hole (hides its rough edges)
+  ctx.fillStyle = "#000";
+  ctx.fillRect(SCREEN_X - 10, SCREEN_Y - 10, W + 20, H + 20);
+
+  // Every game screen draws in "screen space", clipped to the console window
+  ctx.save();
+  ctx.translate(SCREEN_X, SCREEN_Y);
+  ctx.beginPath();
+  ctx.rect(-10, -10, W + 20, H + 20);
+  ctx.clip();
+  drawScreen();
+  ctx.restore();
+
+  // The console body goes on top of everything
+  drawFrame();
+}
+
+// One game screen, drawn in coordinates 0..W x 0..H (the console's window)
+function drawScreen() {
+  if (state === "boot")        { drawBoot();        return; }
+  if (state === "home")        { drawHome();        return; }
+  if (state === "intro")       { drawIntro();       return; }
+  if (state === "leaderboard") { drawLeaderboard(); return; }
+
+  // --- Below: the game world (states "playing", "dying" and "gameover") ---
+  const corr = corruptionAmount();
+
+  ctx.save();
+
+  // Screen shake offset
+  if (shakeTimer > 0) {
+    const s = SHAKE_STRENGTH * (shakeTimer / SHAKE_DURATION);
+    ctx.translate(rand(-s, s), rand(-s, s));
+  }
+
+  // --- Background (image slot first, procedural fallback otherwise) ---
+  if (phase === 2 && assets["bg_phase2"]) {
+    // Phase 2: fixed image + procedural life (parallax, flames, smoke, embers)
+    drawPhase2Bg(assets["bg_phase2"]);
+  } else if (drawSlot("bg_phase" + phase, -20, -20, W + 40, H + 40)) {
+    // static image background loaded, nothing else to draw here
+  } else if (phase === 1) {
+    // Clean "offline dino" look, slowly tinted red as corruption grows
+    const r = Math.round(247 - corr * 30);
+    const gb = Math.round(247 - corr * 60);
+    ctx.fillStyle = `rgb(${r},${gb},${gb})`;
+    ctx.fillRect(-20, -20, W + 40, H + 40);
+
+    // Distant fire glow on the horizon once corruption starts
+    if (corr > 0) {
+      const grad = ctx.createLinearGradient(0, GROUND_Y - 70, 0, GROUND_Y);
+      grad.addColorStop(0, "rgba(255,80,20,0)");
+      grad.addColorStop(1, `rgba(255,80,20,${0.25 * corr})`);
+      ctx.fillStyle = grad;
+      ctx.fillRect(-20, GROUND_Y - 70, W + 40, 70);
+    }
+  } else {
+    // Phase 2: dark chaotic sky
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, "#1a0510");
+    grad.addColorStop(0.7, "#3d0a14");
+    grad.addColorStop(1, "#6b1408");
+    ctx.fillStyle = grad;
+    ctx.fillRect(-20, -20, W + 40, H + 40);
+
+    // Ambient floating embers
+    drawEmbers();
+  }
+
+  // --- Chrome-dino style clouds (phase 1), drifting slower than the ground ---
+  if (phase === 1) drawClouds();
+
+  const ink = phase === 1 ? "#2a2a2a" : "#ffb060";       // main line/obstacle color
+  const voidColor = phase === 1 ? "#1c1c1c" : "#000";    // color inside ground holes
+
+  // --- Ground (image slot tiled & scrolling; line + marks as fallback) ---
+  const groundImg = assets["ground_phase" + phase];
+  if (groundImg) {
+    const stripH = H - GROUND_Y;
+    const tileW = groundImg.width * (stripH / groundImg.height); // keep the image's aspect ratio
+    for (let gx = -(worldX % tileW) - tileW; gx < W + tileW; gx += tileW) {
+      ctx.drawImage(groundImg, gx, GROUND_Y, tileW, stripH);
+    }
+  } else {
+    ctx.fillStyle = ink;
+    ctx.fillRect(-20, GROUND_Y, W + 40, 3);
+    // Small marks scrolling on the ground to sell the speed (dino style)
+    ctx.fillStyle = phase === 1 ? "#b5b5b5" : "#c96a20";
+    for (let i = 0; i < 20; i++) {
+      const mx = ((i * 90) - (worldX % 90));
+      ctx.fillRect(mx, GROUND_Y + 8 + (i % 3) * 6, 14, 2);
+    }
+  }
+
+  // --- Holes cut into the ground (drawn over the ground, image or not) ---
+  for (const g of gaps) {
+    ctx.fillStyle = voidColor;
+    ctx.fillRect(g.x, GROUND_Y - 3, g.w, H - GROUND_Y + 3);
+  }
+
+  // --- Obstacles (numbered variant image first, then base image, then rect) ---
+  for (const o of obstacles) {
+    const base = (o.type === "ground" ? "obstacle_ground_p" : "obstacle_air_p") + phase;
+    if (drawSlot(base + "_" + (o.variant + 1), o.x, o.y, o.w, o.h)) continue; // e.g. obstacle_ground_p1_2
+    if (drawSlot(base, o.x, o.y, o.w, o.h)) continue;                        // single-image fallback
+    if (phase === 1) {
+      ctx.fillStyle = "#2a2a2a";
+      ctx.fillRect(o.x, o.y, o.w, o.h);
+    } else {
+      ctx.fillStyle = o.type === "ground" ? "#ff7020" : "#8030c0";
+      ctx.fillRect(o.x, o.y, o.w, o.h);
+      ctx.fillStyle = "rgba(255,220,80,0.35)"; // hot edge highlight
+      ctx.fillRect(o.x, o.y, o.w, 4);
+    }
+  }
+
+  // --- Collectibles: drawn rect = pickup hitbox = the visible artwork ---
+  for (const c of collectibles) {
+    const box = collectibleBox(c);
+    if (drawSlot(collectibleSlotName(c.kind), box.x, box.y, box.w, box.h)) continue;
+    // Circle fallback, one color per kind so they stay readable
+    const mainColor = c.kind === "boost" ? "#20b0ff" : c.kind === "hodl" ? "#30c060" : (phase === 1 ? "#909090" : "#ffd040");
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+    ctx.fillStyle = mainColor;
+    ctx.fill();
+    ctx.beginPath(); // small inner dot for readability
+    ctx.arc(c.x, c.y, c.r * 0.4, 0, Math.PI * 2);
+    ctx.fillStyle = "#f7f7f7";
+    ctx.fill();
+  }
+
+  // --- Player (the death sequence draws its own character instead) ---
+  if (state === "playing") drawPlayer();
+
+  // Boost feedback: golden speed lines streaking behind the player
+  if (state === "playing" && boostTimer > 0) {
+    ctx.strokeStyle = "rgba(255,208,64,0.7)";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    for (let i = 0; i < 3; i++) {
+      const ly = player.y + 12 + i * 22;
+      const wob = (worldX * 2 + i * 40) % 30; // lines jitter backward for a speed feel
+      ctx.moveTo(player.x - 15 - wob, ly);
+      ctx.lineTo(player.x - 60 - wob, ly);
+    }
+    ctx.stroke();
+  }
+
+  // Debug overlay: green boxes = the REAL collision rects of everything
+  // (player, obstacles, collectibles). Toggle with DEBUG_HITBOX.
+  if (DEBUG_HITBOX && (state === "playing" || state === "dying")) {
+    drawHitboxDebug(); // player box
+    ctx.strokeStyle = "#00e050";
+    ctx.lineWidth = 2;
+    for (const o of obstacles) ctx.strokeRect(o.x, o.y, o.w, o.h);
+    for (const c of collectibles) { const b = collectibleBox(c); ctx.strokeRect(b.x, b.y, b.w, b.h); }
+  }
+
+  // --- Fire wall (phase 2) ---
+  if (phase === 2 && state !== "gameover") drawFireWall();
+
+  // --- Particles ---
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life / 0.7);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+
+  // --- Floating score popups ---
+  for (const p of popups) {
+    ctx.globalAlpha = Math.max(0, p.life / 0.8);
+    ctx.fillStyle = p.color;
+    ctx.font = p.big ? "bold 64px monospace" : "bold 18px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(p.text, p.x, p.y);
+  }
+  ctx.globalAlpha = 1;
+
+  // --- Corruption omen: the sonic grows from afar between 500 and 666 ---
+  if (phase === 1 && corr > 0) drawSonicOmen(corr);
+
+  // --- HUD ---
+  // No backdrop panels; instead the HUD sits further from the edges, because
+  // the phase-2 cabinet art slightly overlaps the screen window borders.
+  const hudColor = phase === 1 ? "#2a2a2a" : "#ffd0a0";
+  ctx.fillStyle = hudColor;
+  ctx.font = "bold 26px monospace";
+  ctx.textAlign = "right";
+  ctx.fillText(String(Math.floor(score)).padStart(5, "0"), W - HUD_INSET_X, HUD_INSET_Y + 10);
+  ctx.font = "16px monospace";
+  ctx.fillText("HI " + String(bestScore).padStart(5, "0"), W - HUD_INSET_X, HUD_INSET_Y + 34);
+
+  // HODL meter (glide fuel), top left
+  const meterW = 150, meterH = 14, mx = HUD_INSET_X, my = HUD_INSET_Y + 6;
+  ctx.fillStyle = "rgba(0,0,0,0.25)";
+  ctx.fillRect(mx, my, meterW, meterH);
+  ctx.fillStyle = "#30c060";
+  ctx.fillRect(mx, my, meterW * (hodlMeter / HODL_METER_MAX), meterH);
+  ctx.strokeStyle = hudColor;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(mx, my, meterW, meterH);
+  ctx.font = "bold 13px monospace";
+  ctx.textAlign = "left";
+  ctx.fillStyle = hudColor;
+  ctx.fillText("HODL", mx, my - 8);
+
+  // Controls reminder, always visible during the run
+  if (state === "playing") drawControlsHint(H - 30, true);
+
+  ctx.restore();
+
+  // --- Screen flash (drawn on top, ignores shake) ---
+  if (flashTimer > 0) {
+    ctx.globalAlpha = Math.min(0.5, flashTimer / FLASH_DURATION * 0.5);
+    ctx.fillStyle = flashColor;
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+  }
+
+  // --- 666 transition: the score, frozen and highlighted ---
+  if (transitionTimer > 0) drawPhaseTransition();
+
+  // --- Overlays on top of the (frozen) world ---
+  if (state === "dying") drawDeathSequence();
+  if (state === "gameover") drawGameOverScreen();
+
+  // --- Pause overlay (P) on top of everything in the window ---
+  if (paused && state === "playing") drawPauseOverlay();
+}
+
+// Draws text in a chunky PIXELATED style: rendered small on an offscreen
+// canvas, then blown up with image smoothing disabled.
+const pixelCanvas = document.createElement("canvas");
+const pixelCtx = pixelCanvas.getContext("2d");
+function drawPixelText(text, cx, cy, smallPx, scaleFactor, color) {
+  pixelCtx.font = "bold " + smallPx + "px monospace";
+  const tw = Math.ceil(pixelCtx.measureText(text).width) + 4;
+  const th = smallPx + 6;
+  pixelCanvas.width = tw;  // resizing also clears the offscreen canvas
+  pixelCanvas.height = th;
+  pixelCtx.font = "bold " + smallPx + "px monospace"; // re-set after the resize
+  pixelCtx.textAlign = "left";
+  pixelCtx.textBaseline = "top";
+  pixelCtx.fillStyle = color;
+  pixelCtx.fillText(text, 2, 2);
+  ctx.save();
+  ctx.imageSmoothingEnabled = false; // this is what makes the pixels chunky
+  ctx.drawImage(pixelCanvas, cx - (tw * scaleFactor) / 2, cy - (th * scaleFactor) / 2, tw * scaleFactor, th * scaleFactor);
+  ctx.restore();
+}
+
+// Current frame of the sonic's 2-frame stop-motion loop (null if missing)
+function sonicFrameName() {
+  const frame = Math.floor(performance.now() / (SONIC_FRAME_T * 1000)) % 2 + 1;
+  if (assets["spam_warning_" + frame]) return "spam_warning_" + frame;
+  return assets["spam_warning_1"] ? "spam_warning_1" : null;
+}
+
+// Draws the sonic at a given growth level (0..1), centered, semi-transparent
+function drawSonicAt(grow) {
+  const name = sonicFrameName();
+  if (!name) return;
+  const eased = grow * grow; // slow start, big finish
+  const h = (0.10 + (SONIC_END_SCALE - 0.10) * eased) * H;
+  const w = h * slotAspect(name);
+  ctx.globalAlpha = 0.10 + (SONIC_MAX_ALPHA - 0.10) * eased;
+  drawSlot(name, W / 2 - w / 2, H * 0.42 - h / 2, w, h);
+  ctx.globalAlpha = 1;
+}
+
+// 666 moment: the sonic stays at WHATEVER size it had reached (its growth is
+// simply cut at 666), while "error : 666" FALLS from the top in soft red pixels.
+function drawPhaseTransition() {
+  drawSonicAt(sonicGrowFinal);
+  const p = 1 - transitionTimer / PHASE2_666_T;
+  const fall = Math.min(1, p / 0.35);           // dropping during the first 35%
+  const y = -120 + (H / 2 + 140) * fall * fall; // accelerating fall
+  const pulse = fall >= 1 ? 1 + Math.sin(performance.now() / 90) * 0.06 : 1;
+  drawPixelText("Error score : 666", W / 2, y, 14, 6 * pulse, "rgba(224,90,90,0.95)");
+}
+
+// The sonic omen: appears tiny in the center (far away) at CORRUPTION_START
+// and grows at its own TIME-based pace (score pickups never make it jump).
+function drawSonicOmen(corr) {
+  if (corruptStartAt < 0) return;
+  drawSonicAt(Math.min(1, (runTime - corruptStartAt) / corruptDuration));
+}
+
+// Pause: gray see-through filter + the old "Anonymous" image big & transparent
+function drawPauseOverlay() {
+  ctx.fillStyle = "rgba(30,30,34,0.55)"; // the run stays visible behind
+  ctx.fillRect(0, 0, W, H);
+  const ph = H * 0.8, pw = ph * slotAspect("pause_menu_check");
+  ctx.globalAlpha = 0.25;
+  drawSlot("pause_menu_check", W / 2 - pw / 2, H / 2 - ph / 2, pw, ph);
+  ctx.globalAlpha = 1;
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#f5f5f5";
+  ctx.font = "bold 48px monospace";
+  ctx.fillText("PAUSE", W / 2, H / 2 - 8);
+  drawKeyCap(W / 2 - 70, H / 2 + 18, 30, 22, "P");
+  ctx.fillStyle = "#cfcfcf";
+  ctx.font = "14px monospace";
+  ctx.textAlign = "left";
+  ctx.fillText("resume", W / 2 - 30, H / 2 + 34);
+}
+
+function drawPlayer() {
+  const px = player.x;
+  const py = player.y;
+
+  // Squash is VISUAL ONLY: we scale the drawing around the feet,
+  // the collision hitbox stays exactly PLAYER_W x PLAYER_H.
+  const drawH = PLAYER_H * squash;
+  const drawW = PLAYER_W * (2 - squash); // conserve area: squash down = widen
+  const ox = px + (PLAYER_W - drawW) / 2;
+  const oy = py + (PLAYER_H - drawH);
+
+  // --- Sprite path (visuals only — the collision hitbox NEVER changes) ---
+  // Both phases use the same animation pipeline; phase 2 will automatically
+  // switch to its own player_p2_* frames the day they exist in assets/.
+  const img = assets[playerSpriteName()];
+  if (img) {
+    drawSpriteAnchored(img);
+    drawHodlTrail(px, py);
+    return;
+  }
+
+  if (phase === 1) {
+    // Phase 1: plain dark runner
+    ctx.fillStyle = "#2a2a2a";
+    ctx.fillRect(ox, oy, drawW, drawH);
+    // Eye
+    ctx.fillStyle = "#f7f7f7";
+    ctx.fillRect(ox + drawW - 11, oy + 8, 5, 5);
+  } else {
+    // Phase 2: THE DEMON — same size, same hitbox, new look
+    ctx.fillStyle = "#d81f1f";
+    ctx.fillRect(ox, oy, drawW, drawH);
+    // Horns (two small triangles on top)
+    ctx.fillStyle = "#ffb060";
+    ctx.beginPath();
+    ctx.moveTo(ox + 4, oy); ctx.lineTo(ox + 9, oy - 10); ctx.lineTo(ox + 14, oy);
+    ctx.moveTo(ox + drawW - 14, oy); ctx.lineTo(ox + drawW - 9, oy - 10); ctx.lineTo(ox + drawW - 4, oy);
+    ctx.fill();
+    // Glowing eye
+    ctx.fillStyle = "#ffe040";
+    ctx.fillRect(ox + drawW - 11, oy + 8, 6, 6);
+  }
+
+  // Little legs while running on the ground (simple 2-frame animation)
+  if (player.grounded) {
+    const legPhase = Math.floor(worldX / 30) % 2;
+    ctx.fillStyle = phase === 1 ? "#2a2a2a" : "#d81f1f";
+    if (legPhase === 0) {
+      ctx.fillRect(ox + 4, GROUND_Y - 4, 6, 4);
+      ctx.fillRect(ox + drawW - 10, GROUND_Y - 8, 6, 8);
+    } else {
+      ctx.fillRect(ox + 4, GROUND_Y - 8, 6, 8);
+      ctx.fillRect(ox + drawW - 10, GROUND_Y - 4, 6, 4);
+    }
+  }
+
+  drawHodlTrail(px, py);
+}
+
+// Which sprite set the player uses: phase 2 gets its own the day the
+// player_p2_* frames exist; until then both phases share the phase-1 set.
+function playerSpritePrefix() {
+  return (phase === 2 && assets["player_p2_run_1"]) ? "player_p2" : "player_p1";
+}
+
+// Picks the sprite frame matching the current player state
+function playerSpriteName() {
+  const pre = playerSpritePrefix();
+  if (!player.grounded) {
+    // Hold frames only show while ACTUALLY gliding (button held + meter not empty)
+    if (holding && player.vy > 0 && hodlMeter > 0) {
+      const f = Math.floor(runTime * ANIM_FPS) % HOLD_FRAME_COUNT + 1;
+      return pre + "_hold_" + f;
+    }
+    if (player.jumpsUsed >= 2) return pre + "_doublejump"; // after the 2nd jump
+    return pre + "_jump";                                  // first jump / simple fall
+  }
+  const f = Math.floor(runTime * ANIM_FPS) % RUN_FRAME_COUNT + 1;
+  return pre + "_run_" + f; // running on the ground
+}
+
+// Draws a player sprite anchored BOTTOM-CENTER on the hitbox's feet line.
+// EVERY frame is drawn at the SAME fixed height (PLAYER_SPRITE_H), whatever
+// its source image size — so the character never changes size between the
+// run, jump, doublejump and hold states. Width follows each frame's ratio.
+function drawSpriteAnchored(img) {
+  // squash is the takeoff/landing juice — visual only, hitbox untouched
+  const h = PLAYER_SPRITE_H * squash;
+  const w = PLAYER_SPRITE_H * (img.width / img.height) * (2 - squash);
+  const anchorX = player.x + PLAYER_W / 2; // horizontal center of the hitbox
+  const anchorY = player.y + PLAYER_H;     // feet line of the hitbox (= ground contact)
+  ctx.drawImage(img, anchorX - w / 2, anchorY - h, w, h);
+}
+
+// Debug: draws the REAL collision box (with its forgiveness padding) over the sprite
+function drawHitboxDebug() {
+  const hb = playerHitbox();
+  ctx.strokeStyle = "#00e050";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(hb.x, hb.y, hb.w, hb.h);
+}
+
+// HODL glide feedback: small trail lines behind the player while gliding
+function drawHodlTrail(px, py) {
+  if (!(holding && !player.grounded && player.vy > 0 && hodlMeter > 0)) return;
+  ctx.strokeStyle = phase === 1 ? "rgba(42,42,42,0.4)" : "rgba(255,200,80,0.6)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(px - 8, py + 6); ctx.lineTo(px - 18, py + 2);
+  ctx.moveTo(px - 8, py + 20); ctx.lineTo(px - 20, py + 18);
+  ctx.stroke();
+}
+
+/* ---------------------------------------------------------------------
+   PHASE 2 ANIMATED BACKGROUND (visual only — no gameplay change)
+   The 1800x1200 bg_phase2.png stays the main backdrop; on top of it we
+   add code-driven life: slow parallax, extra flames, smoke and embers.
+   --------------------------------------------------------------------- */
+function drawPhase2Bg(img) {
+  // -- The background image is drawn ONCE, covering the whole canvas, exactly
+  //    like the original file (same 3:2 ratio). No tiling, no mirror, no
+  //    scrolling: the sense of motion comes only from the overlaid effects.
+  //    It is drawn slightly oversized (kept at 3:2) so the screen-shake never
+  //    reveals the canvas edges.
+  ctx.drawImage(img, -30, -20, W + 60, H + 40);
+
+  const t = performance.now() / 1000;
+
+  // -- Extra procedural flames at fixed spots, flickering over the painted fires
+  for (let i = 0; i < BG_FLAME_COUNT; i++) {
+    const fx = 60 + ((i * 733) % (W - 120));    // fixed, spread across the screen
+    const fy = GROUND_Y - 26 - (i % 3) * 34;    // staggered heights near the horizon
+    const fh = 16 + Math.sin(t * 9 + i * 2.1) * 7; // flickering height
+    const fw = 10 + Math.sin(t * 7 + i * 1.3) * 3; // flickering width
+    ctx.globalAlpha = 0.75;
+    ctx.fillStyle = "#ff6a10";
+    ctx.beginPath();
+    ctx.moveTo(fx - fw / 2, fy); ctx.lineTo(fx, fy - fh); ctx.lineTo(fx + fw / 2, fy);
+    ctx.fill();
+    ctx.fillStyle = "#ffd040"; // hotter inner core
+    ctx.beginPath();
+    ctx.moveTo(fx - fw / 4, fy); ctx.lineTo(fx, fy - fh * 0.55); ctx.lineTo(fx + fw / 4, fy);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // -- Rising smoke puffs (moved in updateBgSmoke); translucent so they stay subtle
+  for (const s of bgSmoke) {
+    ctx.globalAlpha = 0.16 * (1 - s.age / s.maxLife);
+    ctx.fillStyle = "#2a1a22";
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // -- Embers floating through the air
+  drawEmbers();
+}
+
+// Soft fluffy clouds drifting slower than the ground (cheap parallax feel).
+// Overlapping circles + a flat belly = classic cartoon cloud silhouette.
+function drawClouds() {
+  ctx.fillStyle = "rgba(200,200,200,0.65)";
+  for (let i = 0; i < 5; i++) {
+    const cxp = (W + 160) - ((i * 431 + worldX * 0.35) % (W + 240));
+    const cyp = 60 + (i * 83) % 170;
+    const r = 10 + (i % 3) * 4; // size variety between clouds
+    ctx.beginPath();
+    ctx.arc(cxp, cyp, r, 0, Math.PI * 2);
+    ctx.arc(cxp + r * 1.1, cyp - r * 0.75, r * 1.3, 0, Math.PI * 2);
+    ctx.arc(cxp + r * 2.5, cyp - r * 0.55, r * 1.15, 0, Math.PI * 2);
+    ctx.arc(cxp + r * 3.5, cyp, r * 0.95, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillRect(cxp - r * 0.7, cyp - r * 0.15, r * 4.8, r * 1.1); // flat belly
+  }
+}
+
+// Floating embers drifting with the world speed (cheap deterministic pattern,
+// driven by worldX so it needs no stored state)
+function drawEmbers() {
+  ctx.fillStyle = "rgba(255,140,40,0.5)";
+  for (let i = 0; i < BG_EMBER_COUNT; i++) {
+    const ex = (i * 173 + worldX * 0.35) % (W + 40) - 20;
+    const ey = 40 + ((i * 97 + worldX * 0.12) % (GROUND_Y - 60));
+    ctx.fillRect(W - ex, ey, 3, 3);
+  }
+}
+
+function drawFireWall() {
+  // Decorative flickering flames pinned to the left edge — they NEVER advance
+  // toward the player and never kill; pure ambiance.
+  const t = performance.now() / 1000;
+  const front = FIRE_WALL_X;
+
+  // Solid fire body
+  const grad = ctx.createLinearGradient(front - 120, 0, front, 0);
+  grad.addColorStop(0, "#ff3000");
+  grad.addColorStop(1, "rgba(255,120,20,0.85)");
+  ctx.fillStyle = grad;
+  ctx.fillRect(-20, -20, front + 20, H + 40);
+
+  // Flame tongues on the leading edge
+  ctx.fillStyle = "#ffb020";
+  for (let i = 0; i < 10; i++) {
+    const fy = i * (H / 10);
+    const fw = 14 + Math.sin(t * 9 + i * 1.7) * 10;
+    ctx.beginPath();
+    ctx.moveTo(front, fy);
+    ctx.lineTo(front + fw, fy + H / 20);
+    ctx.lineTo(front, fy + H / 10);
+    ctx.fill();
+  }
+}
+
+/* =====================================================================
+   SCREENS (boot, home, intro, death sequence, game over, leaderboard)
+   ===================================================================== */
+
+// Console body drawn over everything. Phase 2 gets its own art during a run.
+function drawFrame() {
+  const inWorld = (state === "playing" || state === "dying" || state === "gameover");
+  const slot = (inWorld && phase === 2) ? "frame_cabinet_phase2" : "frame_cabinet_phase1";
+  if (drawSlot(slot, 0, 0, CANVAS_W, CANVAS_H)) return;
+  if (drawSlot("frame_cabinet", 0, 0, CANVAS_W, CANVAS_H)) return;
+  // Fallback: plain dark bezel filling everything around the screen window
+  ctx.fillStyle = "#191114";
+  ctx.fillRect(0, 0, CANVAS_W, SCREEN_Y);
+  ctx.fillRect(0, SCREEN_Y + H, CANVAS_W, CANVAS_H - SCREEN_Y - H);
+  ctx.fillRect(0, 0, SCREEN_X, CANVAS_H);
+  ctx.fillRect(SCREEN_X + W, 0, CANVAS_W - SCREEN_X - W, CANVAS_H);
+}
+
+// CRT "screen turns on": a bright line grows (BOOT_LINE_T), then the version
+// screen flickers to life and settles (BOOT_VERSION_T)
+function drawBoot() {
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+  const elapsed = (BOOT_LINE_T + BOOT_VERSION_T) - bootTimer;
+
+  if (elapsed < BOOT_LINE_T) {
+    // A thin horizontal line grows from the center of the black screen
+    const lineW = (elapsed / BOOT_LINE_T) * (W - 80);
+    ctx.fillStyle = "#e8ffe8";
+    ctx.fillRect(W / 2 - lineW / 2, H / 2 - 2, lineW, 4);
+  } else {
+    // The version screen flickers in, then holds steady
+    const p = (elapsed - BOOT_LINE_T) / BOOT_VERSION_T; // 0 -> 1
+    const flicker = p < 0.5 ? 0.3 + Math.random() * 0.7 : 1;
+    ctx.globalAlpha = flicker * Math.min(1, p * 2);
+    ctx.fillStyle = "#f7f7f7";
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "rgba(42,42,42,0.85)";
+    ctx.font = "bold 22px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText("DGM SYSTEM V.1", W / 2, H / 2 + 8);
+  }
+}
+
+function drawHome() {
+  // Background (slot; clean phase-1 look as fallback)
+  if (!drawSlot("home_bg", 0, 0, W, H)) {
+    ctx.fillStyle = "#f7f7f7";
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#2a2a2a"; // simple ground line for depth
+    ctx.fillRect(0, GROUND_Y, W, 3);
+  }
+
+  // Title slides down from above the screen (ease-out).
+  // Image only ("demon got me", 1000x200); simple text fallback.
+  const slide = Math.min(1, homeTime / TITLE_SLIDE_DURATION);
+  const ease = 1 - (1 - slide) * (1 - slide);
+  const titleY = -160 + ease * 300; // final center around y = 140
+
+  if (!drawSlot("home_title", W / 2 - 250, titleY - 50, 500, 100)) {
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#2a2a2a";
+    ctx.font = "bold 44px monospace";
+    ctx.fillText("demon got me", W / 2, titleY + 14);
+  }
+
+  // Cactus decor near the right edge (the intro gag bumps into it)
+  drawHomeCactus();
+
+  // Idle character (with his jetpack & sneakers), standing on the ground line
+  const bob = Math.sin(homeTime * 3) * 5;
+  const chImg = assets["home_character_1"] || assets["home_character"];
+  const chX = W * HOME_CHAR_FRAC, chH = INTRO_CHAR_H;
+  if (chImg) {
+    const chW = chH * (chImg.width / chImg.height);
+    ctx.drawImage(chImg, chX - chW / 2, GROUND_Y - chH + bob, chW, chH);
+  } else {
+    ctx.fillStyle = "#2a2a2a";
+    ctx.fillRect(chX - 45, GROUND_Y - 120 + bob, 90, 120);
+    ctx.fillStyle = "#f7f7f7"; // eye
+    ctx.fillRect(chX + 14, GROUND_Y - 96 + bob, 13, 13);
+  }
+
+  drawMenu(["START GAME", "LEADERBOARD"], HOME_MENU_Y, menuIndexHome, "#2a2a2a");
+
+  // Controls drawn as key caps instead of plain text
+  drawControlsHint(H - 44, false);
+
+  ctx.fillStyle = "#909090";
+  ctx.font = "13px monospace";
+  ctx.textAlign = "center";
+  ctx.fillText("BEST " + String(bestScore).padStart(5, "0"), W / 2, 80);
+}
+
+// The cactus standing near the right edge of the home screen
+function drawHomeCactus() {
+  const cactusX = W * INTRO_CACTUS_FRAC;
+  const cw = INTRO_CACTUS_H * slotAspect("obstacle_ground_p1_1");
+  if (!drawSlot("obstacle_ground_p1_1", cactusX - cw / 2, GROUND_Y - INTRO_CACTUS_H, cw, INTRO_CACTUS_H)) {
+    ctx.fillStyle = "#2a8a2a";
+    ctx.fillRect(cactusX - 20, GROUND_Y - INTRO_CACTUS_H, 40, INTRO_CACTUS_H);
+  }
+}
+
+// Shared menu renderer: highlights the selected row
+function drawMenu(items, rowsY, selected, color) {
+  ctx.textAlign = "center";
+  for (let i = 0; i < items.length; i++) {
+    const isSel = i === selected;
+    ctx.font = isSel ? "bold 30px monospace" : "24px monospace";
+    ctx.fillStyle = isSel ? "#ff3020" : color;
+    ctx.fillText(items[i], W / 2, rowsY[i]); // the label itself stays perfectly centered
+    if (isSel) {
+      // selection arrow drawn separately so it doesn't shift the label
+      const tw = ctx.measureText(items[i]).width;
+      ctx.fillText(">", W / 2 - tw / 2 - 26, rowsY[i]);
+    }
+  }
+}
+
+// Draws one keyboard key cap: gray body, darker label for contrast
+function drawKeyCap(x, y, w, h, label) {
+  ctx.fillStyle = "#909090";                 // key body
+  ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = "#5a5a5a";                 // pressed edge at the bottom
+  ctx.fillRect(x, y + h - 3, w, 3);
+  ctx.fillStyle = "#2e2e2e";                 // label, darker gray/black
+  ctx.font = "bold 12px monospace";
+  ctx.textAlign = "center";
+  ctx.fillText(label, x + w / 2, y + h / 2 + 4);
+}
+
+// Controls reminder drawn as key caps; compact=true is the in-game version
+function drawControlsHint(cy, compact) {
+  // Caption color: darker in phase 1 (light bg) so it stays readable
+  const captionColor = (compact && phase === 1) ? "#4a4a4a" : "#909090";
+  ctx.globalAlpha = compact ? 0.85 : 1;
+  if (compact) {
+    // In game: the space bar + what it does
+    drawKeyCap(W / 2 - 130, cy, 90, 20, "SPACE");
+    ctx.fillStyle = captionColor;
+    ctx.font = "12px monospace";
+    ctx.textAlign = "left";
+    ctx.fillText("jump · HODL, you may need it later...", W / 2 - 26, cy + 14);
+  } else {
+    // Menus: arrow keys + space bar
+    drawKeyCap(W / 2 - 210, cy, 26, 22, "↑");
+    drawKeyCap(W / 2 - 180, cy, 26, 22, "↓");
+    ctx.fillStyle = captionColor;
+    ctx.font = "13px monospace";
+    ctx.textAlign = "left";
+    ctx.fillText("navigate", W / 2 - 146, cy + 15);
+    drawKeyCap(W / 2 + 10, cy, 80, 22, "SPACE");
+    // reset style after drawKeyCap so "confirm" matches "navigate" and sits
+    // to the RIGHT of the space key (not inside it)
+    ctx.fillStyle = captionColor;
+    ctx.font = "13px monospace";
+    ctx.textAlign = "left";
+    ctx.fillText("confirm", W / 2 + 100, cy + 15);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// INTRO cinematic: the character walks in with his gear, bumps the cactus,
+// loses everything (that's why the in-game runner is bare), sprints off, and
+// a black wipe brings the actual run in. Press = skip.
+function drawIntro() {
+  const tl = introTimeline();
+  const t = introTime;
+
+  // Same page as HOME: background, title in place, cactus — only the menu is gone
+  if (!drawSlot("home_bg", 0, 0, W, H)) {
+    ctx.fillStyle = "#f7f7f7";
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#2a2a2a";
+    ctx.fillRect(0, GROUND_Y, W, 3);
+  }
+  if (!drawSlot("home_title", W / 2 - 250, 90, 500, 100)) {
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#2a2a2a";
+    ctx.font = "bold 44px monospace";
+    ctx.fillText("demon got me", W / 2, 154);
+  }
+  drawHomeCactus();
+
+  // Character: position + frame depend on where we are in the timeline
+  let x, img = null, charH = INTRO_CHAR_H, alpha = 1;
+  if (t < tl.bump) {
+    // Running from his home spot (left) toward the cactus — fast 2-frame loop
+    x = W * HOME_CHAR_FRAC + INTRO_WALK_SPEED * t;
+    const f = Math.floor(t * INTRO_RUN_FPS) % 2;
+    img = assets[f === 0 ? "home_character_run1" : "home_character_run2"] || assets["home_character_1"];
+  } else if (t < tl.blinkEnd) {
+    // The bump: hurt frames + 2 transparency blinks over INTRO_BLINK_T
+    x = tl.stopX;
+    const bt = t - tl.bump;
+    img = assets[bt < INTRO_BLINK_T / 2 ? "home_character_hurt1" : "home_character_hurt2"];
+    alpha = Math.floor(bt / (INTRO_BLINK_T / 4)) % 2 === 0 ? 0.35 : 1;
+  } else {
+    // Gear lost: the bare in-game runner finishes his run to the right
+    const rt = t - tl.blinkEnd;
+    x = tl.stopX + 0.5 * 1400 * rt * rt; // accelerating exit
+    const f = Math.floor(t * ANIM_FPS) % RUN_FRAME_COUNT + 1;
+    img = assets["player_p1_run_" + f];
+    charH = PLAYER_SPRITE_H; // gameplay size, to match the run that follows
+  }
+  ctx.globalAlpha = alpha;
+  if (img) {
+    const drawW = charH * (img.width / img.height);
+    ctx.drawImage(img, x - drawW / 2, GROUND_Y - charH, drawW, charH);
+  } else {
+    ctx.fillStyle = "#2a2a2a";
+    ctx.fillRect(x - 30, GROUND_Y - charH, 60, charH);
+  }
+  ctx.globalAlpha = 1;
+
+  // The lost gear bouncing on the ground, blinking until it vanishes.
+  // Real images when available (gear_jetpack / gear_sneaker), squares otherwise.
+  const blinkOn = Math.floor(performance.now() / 80) % 2 === 0;
+  for (const g of gearDebris) {
+    if (!blinkOn) continue;
+    ctx.globalAlpha = Math.min(1, g.life);
+    const gImg = assets["gear_" + g.kind];
+    if (gImg) {
+      const gw = g.h * (gImg.width / gImg.height);
+      ctx.drawImage(gImg, g.x, g.y, gw, g.h);
+    } else {
+      ctx.fillStyle = g.color;
+      ctx.fillRect(g.x, g.y, g.w, g.h);
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  // Gear-pop particles live in the shared particle system
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life / 0.7);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+
+  ctx.fillStyle = "#909090";
+  ctx.font = "13px monospace";
+  ctx.textAlign = "center";
+  ctx.fillText("press to skip", W / 2, H - 16);
+
+  // Black wipe sliding in from the right just before the game starts
+  if (t >= tl.wipe) {
+    const p = Math.min(1, (t - tl.wipe) / INTRO_WIPE_T);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(W - p * (W + 20), -10, p * (W + 20) + 20, H + 20);
+  }
+}
+
+// Death sequence (DEATH_SEQUENCE_DURATION): the beat-up loop plays at the
+// player's spot while a big GAME OVER slides from the top to the center.
+// When it settles, the final pose (gameover_character_5) appears, then the
+// flow goes straight to the leaderboard. No dark background — the world
+// stays visible behind a light veil.
+function drawDeathSequence() {
+  const p = 1 - deathTimer / DEATH_SEQUENCE_DURATION; // 0 -> 1
+  const elapsed = DEATH_SEQUENCE_DURATION * p;
+
+  // Light veil only
+  ctx.fillStyle = `rgba(10,5,8,${0.35 * p})`;
+  ctx.fillRect(0, 0, W, H);
+
+  // Beat-up: _1 <-> _2 looping, then _5 as the final pose
+  const cx = player.x + PLAYER_W / 2;
+  const frameName = p < GAMEOVER_FINAL_FRAC
+    ? "gameover_character_" + (Math.floor(elapsed / GAMEOVER_BEAT_FRAME_T) % 2 + 1)
+    : "gameover_character_5";
+  const dieImg = assets[frameName] || assets[playerSpritePrefix() + "_hurt"];
+  if (dieImg) {
+    // same fixed height as the in-game character
+    const h = PLAYER_SPRITE_H, w = h * (dieImg.width / dieImg.height);
+    ctx.drawImage(dieImg, cx - w / 2, player.y + PLAYER_H - h, w, h);
+  } else {
+    const size = PLAYER_W * (1 + Math.sin(p * Math.PI * 6) * 0.15);
+    ctx.save();
+    ctx.translate(cx, player.y + PLAYER_H / 2);
+    ctx.rotate(p * Math.PI * 2);
+    ctx.fillStyle = phase === 1 ? "#2a2a2a" : "#d81f1f";
+    ctx.fillRect(-size / 2, -size / 2, size, size);
+    ctx.restore();
+  }
+
+  // GAME OVER slides from above down to the center across the whole sequence
+  const ease = 1 - (1 - p) * (1 - p); // settles gently at the end
+  const goY = -80 + ease * (H / 2 + 80);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ff3020";
+  ctx.font = "bold 80px monospace";
+  ctx.fillText("GAME OVER", W / 2, goY);
+  ctx.fillStyle = "#f0e0d0";
+  ctx.font = "15px monospace";
+  ctx.fillText("(" + deathCause + ")", W / 2, goY + 38);
+}
+
+// NOTE: currently unused — the flow now goes dying -> leaderboard directly.
+// Kept around in case we bring a game-over menu back later.
+function drawGameOverScreen() {
+  ctx.fillStyle = "rgba(10,5,8,0.85)";
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ff3020";
+  ctx.font = "bold 54px monospace";
+  ctx.fillText("demon got me", W / 2, 170);
+  ctx.fillStyle = "#f0e0d0";
+  ctx.font = "14px monospace";
+  ctx.fillText("(" + deathCause + ")", W / 2, 200);
+  ctx.font = "bold 26px monospace";
+  ctx.fillText("SCORE " + Math.floor(score), W / 2, 260);
+  ctx.font = "18px monospace";
+  ctx.fillText("BEST  " + bestScore, W / 2, 292);
+  // Menu appears once the short restart lock has passed (avoids accidental restarts)
+  if (performance.now() - gameOverTime > RESTART_LOCK * 1000) {
+    drawMenu(["RUN AGAIN", "LEADERBOARD"], GAMEOVER_MENU_Y, menuIndexGameOver, "#f0e0d0");
+  }
+}
+
+/* =====================================================================
+   LEADERBOARD (local only — placeholder names + the player's real best)
+   ===================================================================== */
+
+const DEFAULT_LEADERBOARD = [
+  { name: "D3M0N",      score: 6660 },
+  { name: "MOON",       score: 4200 },
+  { name: "DGMAX",      score: 3333 },
+  { name: "HODL3R",     score: 2500 },
+  { name: "W4GMI",      score: 1999 },
+  { name: "PEPE404",    score: 1337 },
+  { name: "RUGPULL",    score: 999 },
+  { name: "TOUCHGRASS", score: 777 },
+  { name: "C0PE",       score: 420 },
+  { name: "NGMI",       score: 69 }
+];
+
+// Merges the player's saved best score into the fake board (top 10 kept)
+function getLeaderboardRows() {
+  const rows = DEFAULT_LEADERBOARD.map(r => ({ ...r }));
+  if (bestScore > 0) rows.push({ name: "YOU", score: bestScore, you: true });
+  rows.sort((a, b) => b.score - a.score);
+  return rows.slice(0, 10);
+}
+
+function drawLeaderboard() {
+  if (!drawSlot("leaderboard_bg", 0, 0, W, H)) {
+    ctx.fillStyle = "#14090e";
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ff3020";
+  ctx.font = "bold 34px monospace";
+  ctx.fillText("LEADERBOARD", W / 2, 62);
+
+  // Score of the run that just ended (the flow lands here right after a death)
+  if (score > 0) {
+    ctx.fillStyle = "#f0e0d0";
+    ctx.font = "bold 16px monospace";
+    ctx.fillText("LAST RUN  " + Math.floor(score), W / 2, 88);
+  }
+
+  // 10 rows: rank, name, score (the player's row is highlighted)
+  const rows = getLeaderboardRows();
+  ctx.font = "20px monospace";
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const y = 116 + i * 35;
+    ctx.fillStyle = r.you ? "#ffd040" : "#f0e0d0";
+    ctx.textAlign = "left";
+    ctx.fillText(String(i + 1).padStart(2, " ") + ".", 240, y);
+    ctx.fillText(r.name, 300, y);
+    ctx.textAlign = "right";
+    ctx.fillText(String(r.score).padStart(6, " "), 660, y);
+  }
+
+  // Character on the right, picked from the player's rank on the board:
+  // rank 1 -> _4, rank 2 -> _3, ranks 3-4 -> _2, ranks 5-10 -> _1,
+  // not ranked -> the crying leaderboard_character (or its placeholder).
+  const youRank = rows.findIndex(r => r.you) + 1; // 0 = not on the board
+  let tierName = "leaderboard_character";
+  if (youRank === 1) tierName = "leaderboard_character_4";
+  else if (youRank === 2) tierName = "leaderboard_character_3";
+  else if (youRank === 3 || youRank === 4) tierName = "leaderboard_character_2";
+  else if (youRank >= 5) tierName = "leaderboard_character_1";
+
+  const t = performance.now() / 1000;
+  const cx = W * 0.82, cy = 300;
+  const chH = 180, chW = chH * slotAspect(tierName);
+  // Animations by tier: _1 and _3 bob up and down (like the home idle);
+  // _2 and _4 "dance" by mirroring left<->right at least every second.
+  const bobbing = tierName === "leaderboard_character_1" || tierName === "leaderboard_character_3";
+  const dancing = tierName === "leaderboard_character_2" || tierName === "leaderboard_character_4";
+  const bobOff = bobbing ? Math.sin(t * 3) * 7 : 0;
+  const flipped = dancing && Math.floor(t / 1.0) % 2 === 1;
+  ctx.save();
+  if (flipped) { // mirror the drawing around the character's center
+    ctx.translate(cx, 0);
+    ctx.scale(-1, 1);
+    ctx.translate(-cx, 0);
+  }
+  const drawn = drawSlot(tierName, cx - chW / 2, cy - chH / 2 + bobOff, chW, chH);
+  ctx.restore();
+  if (!drawn) {
+    ctx.fillStyle = "#d81f1f";
+    ctx.fillRect(cx - 30, cy - 40, 60, 80);
+    ctx.fillStyle = "#ffe040"; // eye
+    ctx.fillRect(cx + 6, cy - 24, 9, 9);
+    ctx.fillStyle = "#40a0ff"; // falling tears
+    const tearY = (t * 60) % 50;
+    ctx.fillRect(cx + 8, cy - 12 + tearY, 4, 7);
+    ctx.fillRect(cx + 8, cy - 12 + ((tearY + 25) % 50), 3, 5);
+  }
+
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#909090";
+  ctx.font = "14px monospace";
+  ctx.fillText("press to return home", W / 2, H - 16);
+}
+
+/* =====================================================================
+   MAIN LOOP
+   ===================================================================== */
+
+let lastTime = performance.now();
+
+function loop(now) {
+  // Delta time in seconds, clamped so a background tab doesn't teleport the game
+  let dt = (now - lastTime) / 1000;
+  lastTime = now;
+  if (dt > 0.05) dt = 0.05;
+
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+resetRun(); // so a valid world exists before the first run starts
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
