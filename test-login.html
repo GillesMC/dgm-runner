@@ -22,7 +22,7 @@
         document.getElementById("login").onclick = () => {
             db.auth.signInWithOAuth({
                 provider: "x",
-                options: { redirectTo: window.location.href }
+                options: { redirectTo: window.location.origin + window.location.pathname }
             });
         };
 
