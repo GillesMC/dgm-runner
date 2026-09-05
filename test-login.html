@@ -15,7 +15,7 @@
     const db = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
     document.getElementById("login").onclick = () => {
-      db.auth.signInWithOAuth({ provider: "twitter" });
+      db.auth.signInWithOAuth({ provider: "x" });
     };
 
     document.getElementById("logout").onclick = async () => {
