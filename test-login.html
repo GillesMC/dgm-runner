@@ -24,11 +24,11 @@
                 provider: "x",
                 options: { redirectTo: window.location.href }
             });
+        };
 
-            document.getElementById("logout").onclick = async () => {
-                await db.auth.signOut();
-                document.getElementById("out").textContent = "logged out";
-            };
+        document.getElementById("logout").onclick = async () => {
+            await db.auth.signOut();
+            document.getElementById("out").textContent = "logged out";
         };
         // Creates the player row on first login, updates the handle on later ones
         async function savePlayer(user) {
