@@ -10,6 +10,7 @@
 
     <button id="login">Connect with X</button>
     <button id="logout">Logout</button>
+    <button id="score">Send score 7777</button>
     <pre id="out">not connected</pre>
 
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -30,6 +31,7 @@
             await db.auth.signOut();
             document.getElementById("out").textContent = "logged out";
         };
+
         // Creates the player row on first login, updates the handle on later ones
         async function savePlayer(user) {
             const { data, error } = await db
@@ -46,12 +48,29 @@
 
             console.log("savePlayer:", error || data);
         }
+
+        // Sends a score, but only overwrites the stored best if it's higher
+        async function submitScore(user, score) {
+            const { data, error } = await db
+                .from("players")
+                .update({ best_score: score })
+                .eq("user_id", user.id)
+                .lt("best_score", score)
+                .select();
+
+            console.log("submitScore:", error || data);
+        }
+
         // Runs on load: shows the session if the user is already signed in
         db.auth.getSession().then(({ data }) => {
             if (data.session) {
                 document.getElementById("out").textContent =
                     JSON.stringify(data.session.user.user_metadata, null, 2);
                 savePlayer(data.session.user);
+
+                document.getElementById("score").onclick = () => {
+                    submitScore(data.session.user, 7777);
+                };
             }
         });
     </script>
