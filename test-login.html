@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Test login X</title></head>
+<body style="font-family:monospace;padding:40px">
+
+  <button id="login">Connect with X</button>
+  <button id="logout">Logout</button>
+  <pre id="out">not connected</pre>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+    const SUPABASE_URL = "https://ljofhdhkjxsqekhzyehz.supabase.co";
+    const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imxqb2ZoZGhranhzcWVraHp5ZWh6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg2MTE5MjEsImV4cCI6MjEwNDE4NzkyMX0.yuOmRLLSdgsoyO_F9k1lPc8pzFN-UQnG3g663X5NV80";
+
+    const db = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+    document.getElementById("login").onclick = () => {
+      db.auth.signInWithOAuth({ provider: "twitter" });
+    };
+
+    document.getElementById("logout").onclick = async () => {
+      await db.auth.signOut();
+      document.getElementById("out").textContent = "logged out";
+    };
+
+    // Runs on load: shows the session if the user is already signed in
+    db.auth.getSession().then(({ data }) => {
+      if (data.session) {
+        document.getElementById("out").textContent =
+          JSON.stringify(data.session.user.user_metadata, null, 2);
+      }
+    });
+  </script>
+</body>
+</html>
