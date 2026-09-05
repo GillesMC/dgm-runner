@@ -30,14 +30,30 @@
                 document.getElementById("out").textContent = "logged out";
             };
         };
+        // Creates the player row on first login, updates the handle on later ones
+        async function savePlayer(user) {
+            const { data, error } = await db
+                .from("players")
+                .upsert(
+                    {
+                        user_id: user.id,
+                        x_id: user.user_metadata.provider_id,
+                        handle: user.user_metadata.user_name
+                    },
+                    { onConflict: "x_id" }
+                )
+                .select();
 
-            // Runs on load: shows the session if the user is already signed in
-            db.auth.getSession().then(({ data }) => {
-                if (data.session) {
-                    document.getElementById("out").textContent =
-                        JSON.stringify(data.session.user.user_metadata, null, 2);
-                }
-            });
+            console.log("savePlayer:", error || data);
+        }
+        // Runs on load: shows the session if the user is already signed in
+        db.auth.getSession().then(({ data }) => {
+            if (data.session) {
+                document.getElementById("out").textContent =
+                    JSON.stringify(data.session.user.user_metadata, null, 2);
+                savePlayer(data.session.user);
+            }
+        });
     </script>
 </body>
 
